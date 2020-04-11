@@ -49,10 +49,6 @@ struct CustomContext {
 
 impl CustomContext {
     fn find_last_offset(&self, path: &Path) -> Option<i64> {
-        let files = self.export_files.lock().unwrap();
-        if files.keys().len() > 0 {
-            panic!("export file handles are still open");
-        }
         if !path.exists() {
             return None;
         }
@@ -106,10 +102,22 @@ impl ConsumerContext for CustomContext {
                     match self.find_last_offset(&path) {
                         Some(offset) => {
                             let next = offset + 1;
-                            info!("Continuing reading topic '{}' partition {} from previous offset {}",el.topic(),el.partition(),next);
+                            info!(
+                                "Continue reading topic '{}' partition {} from previous offset {}",
+                                el.topic(),
+                                el.partition(),
+                                next
+                            );
                             el.set_offset(rdkafka::topic_partition_list::Offset::Offset(next));
                         }
-                        _ => {}
+                        _ => {
+                            info!(
+                                "Start reading topic '{}' partition {} from beginning",
+                                el.topic(),
+                                el.partition()
+                            );
+                            el.set_offset(rdkafka::topic_partition_list::Offset::Beginning);
+                        }
                     }
                     // open file in append mode and add to file handles
                     {
@@ -143,18 +151,26 @@ impl ConsumerContext for CustomContext {
         };
     }
 
-    fn commit_callback(&self, result: KafkaResult<()>, _offsets: &TopicPartitionList) {
-        println!("Committed offsets: {:?}", result);
+    fn commit_callback(&self, result: KafkaResult<()>, offsets: &TopicPartitionList) {
+        match result {
+            Ok(_) => {
+                for offset in offsets.elements() {
+                    debug!(
+                        "Committed offset for topic '{}' partition {}: {:?}",
+                        offset.topic(),
+                        offset.partition(),
+                        offset.offset()
+                    );
+                }
+            }
+            Err(e) => debug!("Error committing offsets: {:?}", e),
+        }
     }
 }
 
 type LoggingConsumer = StreamConsumer<CustomContext>;
 
-async fn run_async_processor(
-    brokers: String,
-    group_id: String,
-    input_topic: String, // output_topic: &String,
-) {
+fn create_consumer(brokers: String, group_id: String) -> LoggingConsumer {
     let export_files = Arc::new(Mutex::new(HashMap::new()));
     let context = CustomContext {
         export_files: export_files.clone(),
@@ -174,7 +190,10 @@ async fn run_async_processor(
         .set_log_level(RDKafkaLogLevel::Info)
         .create_with_context(context)
         .expect("Consumer creation failed");
+    consumer
+}
 
+async fn run_async_processor(consumer: LoggingConsumer, input_topic: String) {
     consumer
         .subscribe(&[&input_topic])
         .expect("Can't subscribe to specified topic");
@@ -182,7 +201,7 @@ async fn run_async_processor(
     info!("Starting event loop");
     // Create the outer pipeline on the message stream.
     let mut message_stream = consumer.start();
-    let mut count = 0u32;
+    let mut count = 0i64;
     let mut payload_buf = String::new();
     while let Some(message) = message_stream.next().await {
         let borrowed_message = message.unwrap();
@@ -224,7 +243,12 @@ async fn run_async_processor(
         // write buffer to topic/partition file
         {
             let file_prefix = file_prefix(borrowed_message.topic(), borrowed_message.partition());
-            let files = export_files.lock().unwrap();
+            let files = consumer
+                .get_base_consumer()
+                .context()
+                .export_files
+                .lock()
+                .unwrap();
             let mut file = files
                 .get(&file_prefix)
                 .ok_or(format!("Export file not found: {},", file_prefix))
@@ -237,13 +261,13 @@ async fn run_async_processor(
         }
 
         count += 1;
-        if count % 1000 == 0 {
+        if count % 10000 == 0 {
             // break;
-            debug!("Offset {}", borrowed_message.offset());
+            info!("Reached offset {}", borrowed_message.offset());
         }
-        // if let Err(e) = consumer.store_offset(&borrowed_message) {
-        //     warn!("Error while storing offset: {}", e);
-        // }
+        if let Err(e) = consumer.store_offset(&borrowed_message) {
+            warn!("Error while storing offset: {}", e);
+        }
     }
 
     info!("Stream processing terminated");
@@ -259,28 +283,14 @@ async fn main() -> Result<(), ExitFailure> {
     let log_level = args.verbose.log_level().expect("Log level not set");
     simple_logger::init_with_level(log_level).with_context(|_| "Unsupported log level")?;
 
-    // error!("Connecting to {:?}", args.brokers);
-    // warn!("Connecting to {:?}", args.brokers);
-    // info!("Connecting to {:?}", args.brokers);
-    // trace!("Connecting to {:?}", args.brokers);
-
     // futures::future::join_all
-    let worker_tasks: Vec<tokio::task::JoinHandle<()>> = (0..1)
+    let worker_tasks: Vec<tokio::task::JoinHandle<()>> = (0..10)
         .map(|_| {
-            tokio::spawn(run_async_processor(
-                args.brokers.to_owned(),
-                args.group_id.to_owned(),
-                args.topic.to_owned(),
-            ))
+            let consumer = create_consumer(args.brokers.to_owned(), args.group_id.to_owned());
+            tokio::spawn(run_async_processor(consumer, args.topic.to_owned()))
         })
         .collect();
-    // let result =
     futures::future::join_all(worker_tasks).await;
-    // error!("result {:?}", result);
-
-    // .collect::<FuturesUnordered<_>>()
-    //         .for_each(|_| async { () })
-    //         .await;
 
     // cli return
     Ok(())
