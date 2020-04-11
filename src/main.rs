@@ -95,8 +95,8 @@ impl ConsumerContext for CustomContext {
             RDKafkaRespErr::RD_KAFKA_RESP_ERR__ASSIGN_PARTITIONS => {
                 // seek to the last known offset for each assigned topic and create an export file handle
                 for el in tpl.elements() {
-                    let key = file_prefix(el.topic(), el.partition());
-                    let filename = format!("{}.txt", key);
+                    let file_prefix = file_prefix(el.topic(), el.partition());
+                    let filename = format!("{}.txt", file_prefix);
                     let path = Path::new(&filename);
                     // attempt to seek the topic partition to the last offset written in the export file
                     match self.find_last_offset(&path) {
@@ -132,7 +132,7 @@ impl ConsumerContext for CustomContext {
                                 format!("couldn't create export file: {}", path.display())
                             })
                             .unwrap();
-                        files.insert(key, file);
+                        files.insert(file_prefix, file);
                     }
                 }
 
@@ -197,6 +197,7 @@ async fn run_async_processor(consumer: LoggingConsumer, input_topic: String) {
     consumer
         .subscribe(&[&input_topic])
         .expect("Can't subscribe to specified topic");
+    let export_files = &consumer.get_base_consumer().context().export_files;
 
     info!("Starting event loop");
     // Create the outer pipeline on the message stream.
@@ -243,12 +244,7 @@ async fn run_async_processor(consumer: LoggingConsumer, input_topic: String) {
         // write buffer to topic/partition file
         {
             let file_prefix = file_prefix(borrowed_message.topic(), borrowed_message.partition());
-            let files = consumer
-                .get_base_consumer()
-                .context()
-                .export_files
-                .lock()
-                .unwrap();
+            let files = export_files.lock().unwrap();
             let mut file = files
                 .get(&file_prefix)
                 .ok_or(format!("Export file not found: {},", file_prefix))
