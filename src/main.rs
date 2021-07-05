@@ -17,13 +17,12 @@ use rdkafka_sys as rdsys;
 use rev_lines::RevLines;
 use std::collections::HashMap;
 use std::fs::File;
-use std::fs::OpenOptions;
-use std::io::prelude::*;
 use std::io::BufReader;
 use std::path::Path;
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 use std::*;
 use structopt::StructOpt;
+use tokio::io::AsyncWriteExt;
 
 /// Search for a pattern in a file and display the lines that contain it.
 #[derive(Debug, StructOpt)]
@@ -35,6 +34,8 @@ struct Cli {
     group_id: String,
     #[structopt(short = "t", long = "topic")]
     topic: String,
+    #[structopt(default_value = "3", short = "c", long = "clients")]
+    client_count: i8,
     #[structopt(flatten)]
     verbose: clap_verbosity_flag::Verbosity,
 }
@@ -44,7 +45,7 @@ fn file_prefix(topic: &str, partition: i32) -> String {
 }
 
 struct CustomContext {
-    export_files: Arc<Mutex<HashMap<String, File>>>,
+    export_files: Arc<tokio::sync::Mutex<HashMap<String, tokio::fs::File>>>,
 }
 
 impl CustomContext {
@@ -85,16 +86,16 @@ impl ConsumerContext for CustomContext {
         err: RDKafkaRespErr,
         tpl: &mut TopicPartitionList,
     ) {
-        {
+        futures::executor::block_on(async move {
             // drop all file handles
-            let mut files = self.export_files.lock().unwrap();
+            let mut files = self.export_files.lock().await;
             *files = HashMap::new();
-        }
+        });
         // re-assignment
         match err {
             RDKafkaRespErr::RD_KAFKA_RESP_ERR__ASSIGN_PARTITIONS => {
                 // seek to the last known offset for each assigned topic and create an export file handle
-                for el in tpl.elements() {
+                for mut el in tpl.elements() {
                     let file_prefix = file_prefix(el.topic(), el.partition());
                     let filename = format!("{}.txt", file_prefix);
                     let path = Path::new(&filename);
@@ -108,7 +109,8 @@ impl ConsumerContext for CustomContext {
                                 el.partition(),
                                 next
                             );
-                            el.set_offset(rdkafka::topic_partition_list::Offset::Offset(next));
+                            el.set_offset(rdkafka::topic_partition_list::Offset::Offset(next))
+                                .unwrap();
                         }
                         _ => {
                             info!(
@@ -116,24 +118,26 @@ impl ConsumerContext for CustomContext {
                                 el.topic(),
                                 el.partition()
                             );
-                            el.set_offset(rdkafka::topic_partition_list::Offset::Beginning);
+                            el.set_offset(rdkafka::topic_partition_list::Offset::Beginning)
+                                .unwrap();
                         }
                     }
                     // open file in append mode and add to file handles
-                    {
-                        let mut files = self.export_files.lock().unwrap();
-                        let file = OpenOptions::new()
+                    futures::executor::block_on(async move {
+                        let mut files = self.export_files.lock().await;
+                        let file = tokio::fs::OpenOptions::new()
                             .create(true)
                             .append(true)
                             .write(true)
                             .read(false)
                             .open(&path)
+                            .await
                             .with_context(|_| {
                                 format!("couldn't create export file: {}", path.display())
                             })
                             .unwrap();
                         files.insert(file_prefix, file);
-                    }
+                    });
                 }
 
                 unsafe { rdsys::rd_kafka_assign(native_client.ptr(), tpl.ptr()) };
@@ -171,9 +175,8 @@ impl ConsumerContext for CustomContext {
 type LoggingConsumer = StreamConsumer<CustomContext>;
 
 fn create_consumer(brokers: String, group_id: String) -> LoggingConsumer {
-    let export_files = Arc::new(Mutex::new(HashMap::new()));
     let context = CustomContext {
-        export_files: export_files.clone(),
+        export_files: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
     };
     // Create the `StreamConsumer`, to receive the messages from the topic in form of a `Stream`.
     let consumer: LoggingConsumer = ClientConfig::new()
@@ -197,11 +200,12 @@ async fn run_async_processor(consumer: LoggingConsumer, input_topic: String) {
     consumer
         .subscribe(&[&input_topic])
         .expect("Can't subscribe to specified topic");
-    let export_files = &consumer.get_base_consumer().context().export_files;
+    let context = consumer.context().clone();
+    let export_files = &context.inner().export_files;
 
     info!("Starting event loop");
     // Create the outer pipeline on the message stream.
-    let mut message_stream = consumer.start();
+    let mut message_stream = consumer.stream();
     let mut count = 0i64;
     let mut payload_buf = String::new();
     while let Some(message) = message_stream.next().await {
@@ -241,17 +245,18 @@ async fn run_async_processor(consumer: LoggingConsumer, input_topic: String) {
             }
         }
         payload_buf.push('\n');
-        // write buffer to topic/partition file
+        // hold lock in the next block and write buffer to topic/partition file
         {
             let file_prefix = file_prefix(borrowed_message.topic(), borrowed_message.partition());
-            let files = export_files.lock().unwrap();
-            let mut file = files
-                .get(&file_prefix)
+            let mut files = export_files.lock().await;
+            let file = files
+                .get_mut(&file_prefix)
                 .ok_or(format!("Export file not found: {},", file_prefix))
                 .unwrap();
 
             // println!("buf len {}", payload_buf.len());
             file.write_all(payload_buf.as_bytes())
+                .await
                 .with_context(|_| format!("couldn't write to: {}", file_prefix))
                 .unwrap();
         }
@@ -280,7 +285,7 @@ async fn main() -> Result<(), ExitFailure> {
     simple_logger::init_with_level(log_level).with_context(|_| "Unsupported log level")?;
 
     // futures::future::join_all
-    let worker_tasks: Vec<tokio::task::JoinHandle<()>> = (0..10)
+    let worker_tasks: Vec<tokio::task::JoinHandle<()>> = (0..args.client_count)
         .map(|_| {
             let consumer = create_consumer(args.brokers.to_owned(), args.group_id.to_owned());
             tokio::spawn(run_async_processor(consumer, args.topic.to_owned()))

@@ -1,0 +1,7 @@
+{
+	"lldb.executable": "/usr/bin/lldb",
+	"files.watcherExclude": {
+		"**/target/**": true
+	}
+}
+
